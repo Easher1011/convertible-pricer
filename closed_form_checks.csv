@@ -1,0 +1,5 @@
+Check,Exact,Ours,Difference
+"Zero coupon, no spread = bond + 2 Black-Scholes calls",102.20948101651032,102.20927870542293,-0.00020231108739210413
+Shares near zero = straight bond at rate + spread,78.75949747644468,78.75965380067241,0.00015632422773137478
+"Jump-to-default, no conversion value = risky bond formula",79.6884035700359,79.6885884705082,0.00018490047229136053
+Jump-to-default with no default risk = fixed-spread at zero spread,106.29504327465787,106.29504327465793,5.684341886080802e-14

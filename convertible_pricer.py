@@ -189,6 +189,75 @@ def price_convertible_tree(bond: ConvertibleBond, mkt: Market, steps: int = 500)
 
 
 # ---------------------------------------------------------------------
+# 3a. The "conversion probability" tree (what QuantLib does)
+# ---------------------------------------------------------------------
+# An older way to handle credit in a convertible, used by QuantLib's
+# convertible engine. Instead of splitting the value into a cash part and an
+# equity part, each node carries the PROBABILITY the bond ends up converted.
+# Value is then discounted at a blend:
+#     rate = risk-free + (1 - conversion probability) x credit spread
+# Likely to convert -> discount near risk-free. Unlikely -> near rate + spread.
+# It's simpler but a cruder approximation than Tsiveriotis-Fernandes: it
+# blends the discount rate on the WHOLE value instead of keeping the cash and
+# equity parts separate. Kept here so we can reproduce QuantLib exactly.
+
+def price_convertible_tree_cp(bond: ConvertibleBond, mkt: Market, steps: int = 500) -> dict:
+    T = bond.maturity
+    dt = T / steps
+    u = math.exp(mkt.vol * math.sqrt(dt))
+    d = 1.0 / u
+    p = (math.exp((mkt.rate - mkt.div_yield) * dt) - d) / (u - d)
+    if not 0 < p < 1:
+        raise ValueError("Tree probability out of range — increase steps.")
+
+    coupon_amt = bond.face * bond.coupon_rate / bond.coupon_freq
+    coupon_steps = {}
+    for k in range(1, int(round(T * bond.coupon_freq)) + 1):
+        s = int(round((T - (k - 1) / bond.coupon_freq) / dt))
+        coupon_steps[s] = coupon_steps.get(s, 0.0) + coupon_amt
+    put_steps = {int(round(t / dt)) for t in bond.put_dates}
+
+    j = np.arange(steps + 1)
+    S = mkt.spot * u ** (steps - j) * d ** j
+    redemption = bond.face + coupon_steps.get(steps, 0.0)
+    conv = bond.conversion_ratio * S
+    V = np.maximum(conv, redemption)
+    P = (conv > redemption).astype(float)       # conversion probability
+
+    for i in range(steps - 1, -1, -1):
+        t = i * dt
+        S = mkt.spot * u ** (i - np.arange(i + 1)) * d ** np.arange(i + 1)
+        conv = bond.conversion_ratio * S
+        # Each child is discounted at its own blended rate (simple compounding)
+        rate = mkt.rate + (1 - P) * mkt.credit_spread
+        disc = 1.0 / (1.0 + rate * dt)
+        V = p * V[:-1] * disc[:-1] + (1 - p) * V[1:] * disc[1:]
+        P = p * P[:-1] + (1 - p) * P[1:]
+
+        if bond.put_price is not None and i in put_steps:
+            put_now = bond.put_price > V
+            V = np.where(put_now, bond.put_price, V)   # probability left as is
+        if bond.call_price is not None and t >= bond.call_start:
+            called = V > bond.call_price
+            if bond.call_trigger is not None:
+                called &= conv >= bond.call_trigger * bond.face
+            V = np.where(called, np.maximum(bond.call_price, conv), V)
+            # (conversion probability left as is if the holder takes cash;
+            #  a forced conversion is picked up by the >= check just below)
+        convert = conv >= V
+        V = np.where(convert, conv, V)
+        P = np.where(convert, 1.0, P)
+        if i in coupon_steps and i > 0:
+            V = V + coupon_steps[i]
+
+    price = float(V[0])
+    return {"price": price, "delta": float("nan"), "gamma": float("nan"),
+            "bond_part": None, "equity_part": None,
+            "parity": bond.conversion_ratio * mkt.spot,
+            "premium_pct": price / (bond.conversion_ratio * mkt.spot) - 1}
+
+
+# ---------------------------------------------------------------------
 # 3b. Finite-difference pricer (the default)
 # ---------------------------------------------------------------------
 # Same model, different engine. Instead of a tree of share prices that
@@ -271,9 +340,29 @@ def _cn_step(V_next, dt, op, theta, top_value, src=None):
     return solve_banded((1, 1), ab, rhs)
 
 
-def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 500,
+def _aligned_s_max(bond: ConvertibleBond, s_max: float, ns: int) -> float:
+    """
+    Nudge the top of the grid so the bond's key share-price level lands exactly
+    on a grid point. That level is where the value suddenly switches between
+    "cash" and "shares": the soft-call trigger, else the call price, else the
+    redemption amount, each converted to a share price.
+    Without this, the price wobbles as the grid changes, because the switch
+    point sits at a different place between two grid points each time.
+    """
+    if bond.call_price is not None and bond.call_trigger is not None:
+        level = bond.call_trigger * bond.face / bond.conversion_ratio
+    elif bond.call_price is not None:
+        level = bond.call_price / bond.conversion_ratio
+    else:
+        level = bond.face / bond.conversion_ratio
+    k = max(1, round(level * ns / s_max))          # grid point that should sit on it
+    return level * ns / k
+
+
+def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 1000,
                   model: str = "tf", recovery: float = 0.4, hazard_power: float = 1.0,
-                  keep_surface: bool = False, s_max: float | None = None):
+                  keep_surface: bool = False, s_max: float | None = None,
+                  surface_kind: str = "value"):
     """
     Solve on the whole share-price grid, stepping back from maturity to today.
 
@@ -289,12 +378,15 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
     With keep_surface=True also returns (times, surface, surface_B): the value
     (and its cash part, fixed-spread model only) at every time step, rows
     ordered from today to maturity, recorded just after any coupon is paid.
-    The simulator uses this.
+    The simulator uses this. surface_kind="continuation" records instead the
+    value of HOLDING ON at each date, before that day's put / call / convert
+    decisions (used as a decision rule by the Monte Carlo pricer).
     """
     T = bond.maturity
     CR = bond.conversion_ratio
     if s_max is None:
         s_max = 4.0 * max(mkt.spot, bond.conversion_price)
+    s_max = _aligned_s_max(bond, s_max, ns)
     S = np.linspace(0.0, s_max, ns + 1)
     dS = S[1] - S[0]
 
@@ -342,6 +434,7 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
             B = _cn_step(B, dt, op_B, theta, 0.0, src_B)
         V = B + E
         tk = round(t, 10)
+        hold_value = V.copy()                       # before today's decisions
 
         # Holder put
         if bond.put_price is not None and tk in put_set:
@@ -368,8 +461,9 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
 
         # The simulator needs values just AFTER any coupon is paid (it pays the
         # coupon into cash separately), so record the surface before adding it
+        row = hold_value if surface_kind == "continuation" else B + E
         if keep_surface:
-            surface.append(B + E)
+            surface.append(row)
             surface_t.append(t)
             if surface_B is not None:
                 surface_B.append(B.copy())
@@ -380,7 +474,7 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
             if keep_surface:
                 # ...and a row a hair BEFORE the coupon date, still including it,
                 # so the value drops in one step exactly when the coupon is paid
-                surface.append(B + E)
+                surface.append(row + coupons[tk])
                 surface_t.append(t - 1e-9)
                 if surface_B is not None:
                     surface_B.append(B.copy())
@@ -400,7 +494,7 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
 
 
 def price_convertible_fd(bond: ConvertibleBond, mkt: Market, steps: int = 400,
-                         ns: int = 500, model: str = "tf", **model_kw) -> dict:
+                         ns: int = 1000, model: str = "tf", **model_kw) -> dict:
     """Finite-difference price, same outputs as the tree version."""
     S, V, B, E = solve_fd_grid(bond, mkt, steps, ns, model=model, **model_kw)
     dV = np.gradient(V, S)

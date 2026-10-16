@@ -19,6 +19,9 @@ from convertible_pricer import (ConvertibleBond, Market, price_convertible, gree
                                 realised_vol, solve_fd_grid)
 from stress import stress_grid
 from arb_sim import SimSettings, Scenario, SCENARIOS, run_simulation
+from mc_pricer import soft_call_value, TriggerRule
+import os
+import pandas as pd
 
 
 # Colours (colour-blind friendly palette, fixed order)
@@ -108,6 +111,13 @@ def cached_sim(bond_kw, mkt_kw, sim_kw, scenario_kw, model, mkw):
     sim = SimSettings(**sim_kw, scenario=sc)
     return run_simulation(ConvertibleBond(**bond_kw), Market(**mkt_kw), sim,
                           model=model, nt=300, **mkw)
+
+
+@st.cache_data
+def cached_mc(bond_kw, mkt_kw, days_needed, window, n_paths, recovery, hazard_power):
+    return soft_call_value(ConvertibleBond(**bond_kw), Market(**mkt_kw),
+                           TriggerRule(days_needed, window), n_paths=n_paths,
+                           recovery=recovery, hazard_power=hazard_power)
 
 
 @st.cache_data(ttl=3600)
@@ -270,9 +280,9 @@ c[5].metric("Equity part", f"{res['equity_part']:.2f}" if res["equity_part"] is 
 # ---------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Price vs share price", "Sensitivities",
-                                        "Stress test", "Arbitrage simulator",
-                                        "Market check"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Price vs share price", "Sensitivities", "Stress test", "Arbitrage simulator",
+     "Market check", "Path-dependent call", "Validation"])
 
 # ---------- Tab 1: price curve ----------
 with tab1:
@@ -554,12 +564,133 @@ with tab5:
         st.caption("Rolling 1-month realised vol over the past year, against the "
                    "convertible's implied vol.")
 
+# ---------- Tab 6: path-dependent soft call (Monte Carlo) ----------
+with tab6:
+    st.subheader("The real soft call: \"above the trigger on 20 of the last 30 days\"")
+    st.write("The grid can only test today's share price against the trigger. Real "
+             "clauses look back over a window of trading days, so whether the issuer may "
+             "call depends on the **path** the shares took. This tab prices the real clause "
+             "by simulation and shows how much value the simple shortcut misses.")
+    if not (callable_ and soft_call):
+        st.info("Turn on **Issuer can call** and **Soft call** in the sidebar to use this tab.")
+    else:
+        rec = mkw.get("recovery", 0.4)
+        hp = mkw.get("hazard_power", 1.0)
+        if model != "jtd":
+            st.caption(f"Monte Carlo uses the jump-to-default credit model (recovery "
+                       f"{rec:.0%}, sensitivity {hp:g}), so the grid price shown here is "
+                       f"from that model too. Switch the sidebar to Jump-to-default to "
+                       f"change those settings.")
+        with st.form("mc_form"):
+            a, b_, c_ = st.columns(3)
+            days_needed = a.number_input("Days above trigger needed", 1, 60, 20)
+            window = b_.number_input("...out of the last (trading days)", 1, 60, 30)
+            n_mc = c_.select_slider("Number of paths", [5000, 10000, 20000], 10000)
+            st.form_submit_button("Run Monte Carlo", type="primary")
+        if days_needed > window:
+            st.warning("Days needed can't be more than the window.")
+        else:
+            with st.spinner("Simulating paths..."):
+                r = cached_mc(bond_kw, mkt_kw, int(days_needed), int(window), int(n_mc),
+                              rec, hp)
+            m = st.columns(4)
+            m[0].metric("Grid price (today-only trigger)", f"{r['grid_today_only']:.2f}")
+            m[1].metric(f"Extra value of {days_needed}-of-{window} rule",
+                        f"{r['extra_value']:+.2f}",
+                        help=f"± {r['extra_value_se']:.2f} (one standard error)")
+            m[2].metric(f"Price with {days_needed}-of-{window} rule", f"{r['price']:.2f}")
+            m[3].metric("Paths that defaulted", f"{r['pct_defaulted']:.1%}")
+            st.caption(f"Extra value ± {r['extra_value_se']:.2f} (one standard error). "
+                       f"Check: Monte Carlo with the today-only trigger gives "
+                       f"{r['mc_today_only']:.2f} ± {r['mc_today_only_se']:.2f}, against "
+                       f"the grid's {r['grid_today_only']:.2f}.")
+
+        with st.expander("How this works"):
+            st.markdown(
+                "1. **Simulate** thousands of daily share-price paths, with defaults "
+                "(more likely when the shares are low).\n"
+                "2. **Count** along each path how many of the last N trading days closed "
+                "above the trigger.\n"
+                "3. **Work back from maturity.** On each day the holder and issuer decide "
+                "using the grid's value of holding on: the holder puts or converts if that "
+                "pays more; the issuer calls if the path's trigger count allows it and "
+                "holding is worth more than the call price.\n"
+                "4. **Accuracy trick (control variate):** price the bond twice on the "
+                "*same* paths, once with the today-only trigger and once with the real "
+                "rule. Noise is almost identical in both, so the *difference* is precise. "
+                "Final price = grid price + that difference.\n\n"
+                "Why the grid supplies the decisions: the textbook alternative "
+                "(Longstaff–Schwartz regression) is noisy enough here to misjudge early "
+                "conversion by about a point. The grid's decisions are nearly exact, and "
+                "the trigger rule barely changes when the holder should convert, so this "
+                "is a sound shortcut. Regression is still available in `mc_pricer.py` "
+                "(`method=\"regression\"`).")
+
+# ---------- Tab 7: validation ----------
+with tab7:
+    st.subheader("How do we know the numbers are right?")
+    here = os.path.dirname(os.path.abspath(__file__))
+    cf_path = os.path.join(here, "closed_form_checks.csv")
+    bm_path = os.path.join(here, "benchmark_results.csv")
+    if os.path.exists(cf_path):
+        st.markdown("**1. Textbook formulas.** Cases with an exact answer.")
+        cf = pd.read_csv(cf_path)
+        st.dataframe(cf.style.format({"Exact": "{:.4f}", "Ours": "{:.4f}",
+                                      "Difference": "{:+.4f}"}),
+                     hide_index=True, width="stretch")
+    if os.path.exists(bm_path):
+        bm = pd.read_csv(bm_path)
+        st.markdown("**2. QuantLib**, the industry-standard open-source pricing library, "
+                    f"on {len(bm)} bonds (no call, hard call, soft call, put; different "
+                    "share prices, vols, spreads, coupons and dividends).")
+        c = st.columns(3)
+        c[0].metric("Our replica of QuantLib's method vs QuantLib",
+                    f"{bm['1. Replica - QuantLib'].abs().mean():.3f}",
+                    help=f"Average gap per 100 face; largest "
+                         f"{bm['1. Replica - QuantLib'].abs().max():.3f}")
+        c[1].metric("Grid vs grid twice as fine",
+                    f"{bm['2. FD convergence'].abs().mean():.3f}",
+                    help=f"Average gap; largest {bm['2. FD convergence'].abs().max():.3f}")
+        c[2].metric("Our model vs QuantLib's model",
+                    f"{bm['3. TF - QuantLib (model gap)'].abs().mean():.2f}",
+                    help=f"Average gap; largest "
+                         f"{bm['3. TF - QuantLib (model gap)'].abs().max():.2f}. A real "
+                         f"model difference, explained below.")
+        st.markdown(
+            "- **Replica vs QuantLib (≈ 0):** QuantLib's convertible engine doesn't use "
+            "the Tsiveriotis–Fernandes cash/equity split. It tracks the probability of "
+            "conversion at each tree node and discounts the whole value at a blend, "
+            "*rate + (1 − probability) × spread*. Rebuilding that method separately and "
+            "matching QuantLib to a few hundredths confirms both our tree code and what "
+            "QuantLib does.\n"
+            "- **Grid convergence (≈ 0):** halving the grid spacing barely moves the price.\n"
+            "- **Model gap (up to ~1.8 points):** the two models genuinely differ. "
+            "Tsiveriotis–Fernandes charges the credit spread only on the part of the value "
+            "that depends on the issuer paying cash; the blended method spreads it across "
+            "the whole value. A gap this size is bigger than many trading edges, which is "
+            "why the choice of credit model matters.")
+        show = bm[["Bond", "Share price", "Vol", "Spread (bp)", "QuantLib",
+                   "Our replica of QuantLib", "1. Replica - QuantLib",
+                   "Our TF finite diff", "3. TF - QuantLib (model gap)"]]
+        with st.expander("Full benchmark table"):
+            st.dataframe(show.style.format(precision=3), hide_index=True, width="stretch")
+    if not (os.path.exists(cf_path) or os.path.exists(bm_path)):
+        st.info("Run `python benchmark.py` once (needs `pip install QuantLib`) to create "
+                "the validation results.")
+    st.markdown("**3. Built-in checks** used while building the simulator and Monte Carlo "
+                "pricer: the delta-hedged trade earns zero on average when realised vol "
+                "equals implied and there's no credit or borrow cost; under jump-to-default, "
+                "default losses exactly offset credit carry; and Monte Carlo with a "
+                "today-only trigger reproduces the grid.")
+
+
 
 st.divider()
 st.caption("Model notes: fixed-spread model after Tsiveriotis & Fernandes (1998); "
            "jump-to-default with a hazard rate that rises as the share price falls, "
            "calibrated so today's spread = hazard × (1 − recovery). Crank–Nicolson finite "
            "differences on a fixed share-price grid, with Rannacher smoothing after coupons "
-           "and events. Soft calls are tested on the current share price rather than over a "
-           "trading-day window. The simulator uses risk-neutral share drift and a constant "
+           "and events. The grid tests soft calls on the current share price; the "
+           "Path-dependent call tab prices the real look-back clause by Monte Carlo. "
+           "The simulator uses risk-neutral share drift and a constant "
            "realised vol, with no transaction costs.")
