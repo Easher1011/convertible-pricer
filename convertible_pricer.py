@@ -224,14 +224,77 @@ def _event_times(bond: ConvertibleBond):
     return coupons, events
 
 
-def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 500):
+def hazard_rate(S, mkt: Market, recovery: float = 0.4, hazard_power: float = 1.0,
+                cap: float = 5.0):
     """
-    Solve on the whole share-price grid. Returns (S, V, B, E) at today:
-    the grid of share prices, total value, cash part and equity part.
+    Default intensity (chance of default per year) at each share price.
+
+    Calibrated so that at TODAY's share price the bond's credit spread equals
+    the spread input:  spread = hazard x (1 - recovery)  ("credit triangle").
+    It then rises as the share price falls:
+        hazard(S) = hazard_today x (spot / S) ^ hazard_power
+    hazard_power = 0 means default risk doesn't depend on the share price.
+    Capped (default 500%/yr) so it stays finite as the share price nears zero.
+    """
+    lam0 = max(mkt.credit_spread, 0.0) / (1 - recovery)
+    S_safe = np.maximum(np.asarray(S, dtype=float), 1e-8)
+    return np.minimum(lam0 * (mkt.spot / S_safe) ** hazard_power, cap)
+
+
+def _operator(alpha, S, dS, drift, disc):
+    """Grid version of the Black-Scholes operator: links to node below, itself, above."""
+    beta = drift * S / (2 * dS)
+    return alpha - beta, -2 * alpha - disc, alpha + beta
+
+
+def _cn_step(V_next, dt, op, theta, top_value, src=None):
+    """
+    One step back in time (Crank-Nicolson when theta = 0.5, fully implicit at 1):
+        (I - theta dt L) V = (I + (1 - theta) dt L) V_next + dt * src
+    """
+    lo, mid, up = op
+    n = len(V_next)
+    LV = mid * V_next
+    LV[1:] += lo[1:] * V_next[:-1]
+    LV[:-1] += up[:-1] * V_next[1:]
+    rhs = V_next + (1 - theta) * dt * LV
+    if src is not None:
+        rhs = rhs + dt * src
+    diag = 1 - theta * dt * mid
+    lower = -theta * dt * lo
+    upper = -theta * dt * up
+    diag[-1], lower[-1], rhs[-1] = 1.0, 0.0, top_value   # top row: value fixed
+    ab = np.zeros((3, n))
+    ab[0, 1:] = upper[:-1]
+    ab[1, :] = diag
+    ab[2, :-1] = lower[1:]
+    return solve_banded((1, 1), ab, rhs)
+
+
+def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 500,
+                  model: str = "tf", recovery: float = 0.4, hazard_power: float = 1.0,
+                  keep_surface: bool = False, s_max: float | None = None):
+    """
+    Solve on the whole share-price grid, stepping back from maturity to today.
+
+    model = "tf"  -> Tsiveriotis-Fernandes: fixed credit spread, value split into
+                     a cash part (discounted at rate + spread) and an equity part
+                     (discounted at the risk-free rate).
+    model = "jtd" -> Jump-to-default: default can happen at any moment, more
+                     likely when the share price is low. On default the shares
+                     drop to zero and the bond pays recovery x face.
+
+    Returns (S, V, B, E): share-price grid, total value, cash part, equity part
+    (B and E are None for the jump-to-default model, where there's no split).
+    With keep_surface=True also returns (times, surface, surface_B): the value
+    (and its cash part, fixed-spread model only) at every time step, rows
+    ordered from today to maturity, recorded just after any coupon is paid.
+    The simulator uses this.
     """
     T = bond.maturity
     CR = bond.conversion_ratio
-    s_max = 4.0 * max(mkt.spot, bond.conversion_price)
+    if s_max is None:
+        s_max = 4.0 * max(mkt.spot, bond.conversion_price)
     S = np.linspace(0.0, s_max, ns + 1)
     dS = S[1] - S[0]
 
@@ -239,6 +302,7 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
     times = np.unique(np.round(np.concatenate([np.linspace(0, T, nt + 1),
                                                np.array(sorted(events))]), 10))
     put_set = {round(t, 10) for t in bond.put_dates}
+    jtd = model == "jtd"
 
     # --- Payoff at maturity ---
     redemption = bond.face + coupons.get(round(T, 10), 0.0)
@@ -246,42 +310,36 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
     convert = conv > redemption
     E = np.where(convert, conv, 0.0)
     B = np.where(convert, 0.0, redemption)
+    if jtd:                                         # no split in this model
+        B, E = B + E, np.zeros_like(S)
 
-    # --- The Black-Scholes operator on the grid (one row per share price) ---
+    # --- Operators (fixed through time) ---
     alpha = 0.5 * mkt.vol**2 * S**2 / dS**2
-    beta = (mkt.rate - mkt.div_yield) * S / (2 * dS)
-    lo, up = alpha - beta, alpha + beta             # links to the node below / above
+    carry = mkt.rate - mkt.div_yield
+    if jtd:
+        lam = hazard_rate(S, mkt, recovery, hazard_power)
+        # Shares must drift up by the hazard rate to make up for the default jump
+        op_B = _operator(alpha, S, dS, carry + lam, mkt.rate + lam)
+        src_B = lam * recovery * bond.face          # what you get paid on default
+    else:
+        op_E = _operator(alpha, S, dS, carry, mkt.rate)
+        op_B = _operator(alpha, S, dS, carry, mkt.rate + mkt.credit_spread)
+        src_B = None
 
-    def L_apply(V, disc):
-        """Black-Scholes operator applied to V, for a given discount rate."""
-        out = (-2 * alpha - disc) * V
-        out[1:] += lo[1:] * V[:-1]
-        out[:-1] += up[:-1] * V[1:]
-        return out
-
-    def step(V_next, dt, disc, theta, top_value):
-        """One step back in time: (I - theta dt L) V = (I + (1-theta) dt L) V_next."""
-        rhs = V_next + (1 - theta) * dt * L_apply(V_next, disc)
-        diag = 1 + theta * dt * (2 * alpha + disc)
-        lower = -theta * dt * lo
-        upper = -theta * dt * up
-        # Top row: fix the value (deep in the money = converted)
-        diag[-1], lower[-1], rhs[-1] = 1.0, 0.0, top_value
-        # S = 0 row has no link below
-        ab = np.zeros((3, ns + 1))
-        ab[0, 1:] = upper[:-1]
-        ab[1, :] = diag
-        ab[2, :-1] = lower[1:]
-        return solve_banded((1, 1), ab, rhs)
-
+    surface = [B + E] if keep_surface else None
+    surface_B = [B.copy()] if (keep_surface and not jtd) else None
+    surface_t = [T]
     implicit_left = 4                               # Rannacher steps remaining
     for n in range(len(times) - 2, -1, -1):
         t, dt = times[n], times[n + 1] - times[n]
         theta = 1.0 if implicit_left > 0 else 0.5
         implicit_left -= 1
 
-        E = step(E, dt, mkt.rate, theta, CR * s_max)
-        B = step(B, dt, mkt.rate + mkt.credit_spread, theta, 0.0)
+        if jtd:
+            B = _cn_step(B, dt, op_B, theta, CR * s_max, src_B)
+        else:
+            E = _cn_step(E, dt, op_E, theta, CR * s_max)
+            B = _cn_step(B, dt, op_B, theta, 0.0, src_B)
         V = B + E
         tk = round(t, 10)
 
@@ -308,20 +366,43 @@ def solve_fd_grid(bond: ConvertibleBond, mkt: Market, nt: int = 400, ns: int = 5
         E = np.where(convert, conv, E)
         B = np.where(convert, 0.0, B)
 
+        # The simulator needs values just AFTER any coupon is paid (it pays the
+        # coupon into cash separately), so record the surface before adding it
+        if keep_surface:
+            surface.append(B + E)
+            surface_t.append(t)
+            if surface_B is not None:
+                surface_B.append(B.copy())
+
         # Coupon paid today (holder gets it whatever they decided)
         if 0 < t and tk in coupons and tk < round(T, 10):
             B = B + coupons[tk]
+            if keep_surface:
+                # ...and a row a hair BEFORE the coupon date, still including it,
+                # so the value drops in one step exactly when the coupon is paid
+                surface.append(B + E)
+                surface_t.append(t - 1e-9)
+                if surface_B is not None:
+                    surface_B.append(B.copy())
 
+        if jtd:
+            B, E = B + E, np.zeros_like(S)
         if tk in events:
             implicit_left = 2                       # smooth again after a jump
 
-    return S, B + E, B, E
+    V = B + E
+    out_B, out_E = (None, None) if jtd else (B, E)
+    if keep_surface:
+        surf_B = np.array(surface_B[::-1]) if surface_B is not None else None
+        return (S, V, out_B, out_E, np.array(surface_t[::-1]),
+                np.array(surface[::-1]), surf_B)
+    return S, V, out_B, out_E
 
 
 def price_convertible_fd(bond: ConvertibleBond, mkt: Market, steps: int = 400,
-                         ns: int = 500) -> dict:
+                         ns: int = 500, model: str = "tf", **model_kw) -> dict:
     """Finite-difference price, same outputs as the tree version."""
-    S, V, B, E = solve_fd_grid(bond, mkt, steps, ns)
+    S, V, B, E = solve_fd_grid(bond, mkt, steps, ns, model=model, **model_kw)
     dV = np.gradient(V, S)
     d2V = np.gradient(dV, S)
     price = float(np.interp(mkt.spot, S, V))
@@ -329,31 +410,34 @@ def price_convertible_fd(bond: ConvertibleBond, mkt: Market, steps: int = 400,
         "price": price,
         "delta": float(np.interp(mkt.spot, S, dV)),
         "gamma": float(np.interp(mkt.spot, S, d2V)),
-        "bond_part": float(np.interp(mkt.spot, S, B)),
-        "equity_part": float(np.interp(mkt.spot, S, E)),
+        "bond_part": float(np.interp(mkt.spot, S, B)) if B is not None else None,
+        "equity_part": float(np.interp(mkt.spot, S, E)) if E is not None else None,
         "parity": bond.conversion_ratio * mkt.spot,
         "premium_pct": price / (bond.conversion_ratio * mkt.spot) - 1,
     }
 
 
 def price_convertible(bond: ConvertibleBond, mkt: Market, steps: int = 400,
-                      method: str = "fd") -> dict:
+                      method: str = "fd", model: str = "tf", **model_kw) -> dict:
     """
     Price a convertible bond.
     method = "fd"   -> finite-difference grid (default, smooth)
     method = "tree" -> binomial tree (simpler, a bit noisy with calls)
+    model  = "tf"   -> fixed credit spread (Tsiveriotis-Fernandes)
+    model  = "jtd"  -> jump-to-default; extra settings: recovery, hazard_power
     """
     if method == "tree":
+        if model != "tf":
+            raise ValueError("The tree only supports the fixed-spread model.")
         return price_convertible_tree(bond, mkt, steps)
-    return price_convertible_fd(bond, mkt, steps)
-
+    return price_convertible_fd(bond, mkt, steps, model=model, **model_kw)
 
 
 # ---------------------------------------------------------------------
 # 4. Greeks — how the price reacts to changes (simple "bump and reprice")
 # ---------------------------------------------------------------------
 def greeks(bond: ConvertibleBond, mkt: Market, steps: int = 400,
-           method: str = "fd") -> dict:
+           method: str = "fd", model: str = "tf", **model_kw) -> dict:
     """
     Delta and gamma come straight from the grid (or tree).
     The others use "bump and reprice": nudge one input, price again, compare.
@@ -364,9 +448,9 @@ def greeks(bond: ConvertibleBond, mkt: Market, steps: int = 400,
     """
     def px(**changes):
         m = Market(**{**mkt.__dict__, **changes})
-        return price_convertible(bond, m, steps, method)["price"]
+        return price_convertible(bond, m, steps, method, model, **model_kw)["price"]
 
-    res = price_convertible(bond, mkt, steps, method)
+    res = price_convertible(bond, mkt, steps, method, model, **model_kw)
     vb = 0.05 if method == "tree" else 0.01
     bp = 0.0001
 
@@ -404,15 +488,30 @@ def accrued_interest(bond: ConvertibleBond) -> float:
     return bond.face * bond.coupon_rate / bond.coupon_freq * fraction_elapsed
 
 
-def _solve(fn, target, lo, hi, tol=1e-4, max_iter=60):
+def _solve(fn, target, lo, hi, tol=1e-4, max_iter=60, scan=12):
     """
-    Bisection: keep halving the range [lo, hi] until fn(x) hits target.
-    Slower than fancier methods but never gets confused by tree noise.
+    Find x in [lo, hi] where fn(x) = target.
+
+    First a coarse scan from low to high, to find the FIRST place the price
+    crosses the target. (Under the jump-to-default model, price isn't always
+    one-directional in spread: very high default risk pushes up the value of
+    the conversion option. We want the sensible, lower answer.)
+    Then bisection: keep halving that bracket until it's tiny.
     Returns None if the target is outside what the range can produce.
     """
-    f_lo, f_hi = fn(lo) - target, fn(hi) - target
-    if f_lo * f_hi > 0:
+    xs = np.linspace(lo, hi, scan + 1)
+    fs = [fn(x) - target for x in xs]
+    bracket = None
+    for i in range(scan):
+        if fs[i] == 0:
+            return float(xs[i])
+        if fs[i] * fs[i + 1] < 0:
+            bracket = i
+            break
+    if bracket is None:
         return None
+    lo, hi = xs[bracket], xs[bracket + 1]
+    f_lo, f_hi = fs[bracket], fs[bracket + 1]
     for _ in range(max_iter):
         mid = (lo + hi) / 2
         f_mid = fn(mid) - target
@@ -426,21 +525,24 @@ def _solve(fn, target, lo, hi, tol=1e-4, max_iter=60):
 
 
 def implied_vol(bond: ConvertibleBond, mkt: Market, dirty_price: float,
-                steps: int = 400, method: str = "fd") -> float | None:
+                steps: int = 400, method: str = "fd", model: str = "tf",
+                **model_kw) -> float | None:
     """Volatility that makes the model price equal the market (dirty) price."""
     def px(v):
         return price_convertible(bond, Market(**{**mkt.__dict__, "vol": v}),
-                                 steps, method)["price"]
+                                 steps, method, model, **model_kw)["price"]
     return _solve(px, dirty_price, 0.01, 1.50)
 
 
 def implied_spread(bond: ConvertibleBond, mkt: Market, dirty_price: float,
-                   steps: int = 400, method: str = "fd") -> float | None:
+                   steps: int = 400, method: str = "fd", model: str = "tf",
+                   **model_kw) -> float | None:
     """Credit spread that makes the model price equal the market (dirty) price."""
     def px(s):
         return price_convertible(bond, Market(**{**mkt.__dict__, "credit_spread": s}),
-                                 steps, method)["price"]
-    return _solve(px, dirty_price, -0.01, 0.40)
+                                 steps, method, model, **model_kw)["price"]
+    lo = 0.0 if model == "jtd" else -0.01     # default risk can't be negative
+    return _solve(px, dirty_price, lo, 0.40)
 
 
 def realised_vol(prices) -> float:
